@@ -1,0 +1,7 @@
+# Explicit package pins; deployment target: Python 3.12.
+streamlit==1.50.0
+pandas==2.3.3
+numpy==2.0.2
+# Included for financial cross-checks and future chart extensions.
+numpy-financial==1.0.0
+plotly==6.3.1
