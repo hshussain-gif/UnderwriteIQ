@@ -1,10 +1,10 @@
-# CreditScope AI
+# UnderwriteIQ
 
 ### Commercial Credit Underwriting & Financial Risk Intelligence
 
 **Custom financial logic. Explainable credit decisions. ZERO API costs.**
 
-CreditScope AI converts three years of manufacturing financial statements into an underwriting assessment: financial ratios, loan repayment schedules, stress scenarios, a transparent risk rating, and a committee-ready credit memorandum. The interactive **Challenge the Analyst** module answers questions about downside resilience, borrowing capacity, and loan structure using local mathematics.
+UnderwriteIQ converts three years of manufacturing financial statements into an underwriting assessment: financial ratios, loan repayment schedules, stress scenarios, a transparent risk rating, and a committee-ready credit memorandum. The interactive **Challenge the Analyst** module answers questions about downside resilience, borrowing capacity, and loan structure using local mathematics.
 
 Every calculation and narrative comes from a custom Python financial engine. No LLM, paid API key, market-data subscription, external financial-data feed, or database is required. The “AI” name reflects expert-system behavior: explicit rules select narratives and recommendations from financial evidence.
 
