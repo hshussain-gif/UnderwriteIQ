@@ -3,20 +3,24 @@ Dependencies: streamlit, pandas, plotly. All monetary inputs are full USD.
 """
 from dataclasses import dataclass, replace
 from decimal import Decimal, ROUND_HALF_UP
+import hashlib
 import math
 
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from edgar_import import (MAX_TOTAL_BYTES, build_import_matrix, fact_browser,
+                          merge_filings, select_fact)
 
 YEARS = ["Year 1", "Year 2", "Year 3"]
 STATEMENTS = {
     "Income Statement": {
         "Revenue": [40_000_000, 45_000_000, 50_000_000],
         "Cost of goods sold": [26_000_000, 29_250_000, 32_500_000],
-        "Operating expenses (excluding D&A)": [6_800_000, 7_650_000, 8_500_000],
+        "Operating expenses (reported)": [8_300_000, 9_250_000, 10_200_000],
         "Depreciation and amortization": [1_500_000, 1_600_000, 1_700_000],
         "Interest expense": [900_000, 900_000, 900_000],
+        "Other non-operating income / (expense)": [0, 0, 0],
         "Income tax expense": [1_300_000, 1_400_000, 1_500_000],
     },
     "Balance Sheet": {
@@ -26,9 +30,11 @@ STATEMENTS = {
         "Inventory": [6_000_000, 6_500_000, 7_000_000],
         "Other current assets": [500_000, 500_000, 500_000],
         "Net property, plant and equipment": [16_000_000, 17_000_000, 18_000_000],
+        "Other noncurrent assets": [0, 0, 0],
         "Accounts payable and accruals": [4_000_000, 4_500_000, 5_000_000],
         "Short-term debt": [1_000_000, 1_000_000, 1_000_000],
         "Current portion of long-term debt": [1_500_000, 1_500_000, 1_500_000],
+        "Other current liabilities": [0, 0, 0],
         "Long-term debt (excluding current portion)": [9_500_000, 9_500_000, 9_500_000],
         "Other noncurrent liabilities": [2_000_000, 2_500_000, 3_000_000],
         "Shareholders' equity": [12_000_000, 14_000_000, 16_000_000],
@@ -37,9 +43,12 @@ STATEMENTS = {
         "Beginning cash": [1_500_000, 2_000_000, 2_500_000],
         "Cash from operations (after interest and taxes)": [5_000_000, 6_700_000, 8_400_000],
         "Capital expenditures": [3_000_000, 4_000_000, 5_000_000],
+        "Other investing cash flow": [0, 0, 0],
         "Existing debt proceeds": [1_500_000, 1_500_000, 1_500_000],
         "Existing principal repayments": [1_500_000, 1_500_000, 1_500_000],
         "Dividends": [1_500_000, 2_200_000, 2_900_000],
+        "Other financing cash flow": [0, 0, 0],
+        "FX effect on cash": [0, 0, 0],
         "Existing cash interest paid": [900_000, 900_000, 900_000],
     },
 }
@@ -85,7 +94,9 @@ def validate_financial_data(frame):
     keys = list(zip(result["Statement"], result["Line item"]))
     if len(set(keys)) != len(keys) or set(keys) != required:
         raise ValueError("Statement/line-item pairs must be unique and match the baseline schema.")
-    signed = {"Shareholders' equity", "Income tax expense", "Cash from operations (after interest and taxes)"}
+    signed = {"Shareholders' equity", "Income tax expense", "Cash from operations (after interest and taxes)",
+              "Other non-operating income / (expense)", "Other investing cash flow",
+              "Other financing cash flow", "FX effect on cash"}
     for year in YEARS:
         result[year] = pd.to_numeric(result[year], errors="coerce").astype(float)
         if not result[year].map(lambda value: math.isfinite(float(value))).all():
@@ -112,17 +123,19 @@ def financials(frame, year):
     """Read named rows from the canonical matrix; callers validate once at the boundary."""
     values = frame.set_index("Line item")[year].to_dict()
     gross = values["Revenue"] - values["Cost of goods sold"]
-    ebitda = gross - values["Operating expenses (excluding D&A)"]
-    pretax = ebitda - values["Depreciation and amortization"] - values["Interest expense"]
+    ebitda = gross - values["Operating expenses (reported)"] + values["Depreciation and amortization"]
+    pretax = (ebitda - values["Depreciation and amortization"] - values["Interest expense"]
+              + values["Other non-operating income / (expense)"])
     quick = sum(values[k] for k in ("Cash and equivalents", "Short-term investments", "Accounts receivable"))
     current_assets = quick + values["Inventory"] + values["Other current assets"]
-    current_liabilities = sum(values[k] for k in ("Accounts payable and accruals", "Short-term debt", "Current portion of long-term debt"))
+    current_liabilities = sum(values[k] for k in ("Accounts payable and accruals", "Short-term debt", "Current portion of long-term debt", "Other current liabilities"))
     debt = sum(values[k] for k in ("Short-term debt", "Current portion of long-term debt", "Long-term debt (excluding current portion)"))
     service = values["Existing principal repayments"] + values["Existing cash interest paid"]
     cash = (values["Beginning cash"] + values["Cash from operations (after interest and taxes)"]
             - values["Capital expenditures"] + values["Existing debt proceeds"]
-            - values["Existing principal repayments"] - values["Dividends"])
-    balance_gap = (current_assets + values["Net property, plant and equipment"] - current_liabilities
+            - values["Existing principal repayments"] - values["Dividends"]
+            + values["Other investing cash flow"] + values["Other financing cash flow"] + values["FX effect on cash"])
+    balance_gap = (current_assets + values["Net property, plant and equipment"] + values["Other noncurrent assets"] - current_liabilities
                    - values["Long-term debt (excluding current portion)"]
                    - values["Other noncurrent liabilities"] - values["Shareholders' equity"])
     return {"values": values, "ebitda": ebitda, "pretax": pretax, "debt": debt, "service": service,
@@ -143,7 +156,144 @@ def consistency_issues(frame):
     for previous, current in zip(YEARS, YEARS[1:]):
         if abs(financials(frame, current)["values"]["Beginning cash"] - financials(frame, previous)["values"]["Cash and equivalents"]) > 1:
             issues.append(f"{current} opening cash differs from {previous} closing cash.")
-    return issues
+    return issues + list(frame.attrs.get("source_reconciliation_issues", []))
+
+
+def source_reconciliations(report, frame):
+    """Compare reviewed inputs to separately tagged statement totals, not just plugs."""
+    rows = []
+    for year, (start, end) in zip(YEARS, report["periods"]):
+        history = financials(frame, year)
+        v = history["values"]
+        checks = [
+            ("Operating income", ("OperatingIncomeLoss",), False, history["ebitda"] - v["Depreciation and amortization"]),
+            ("Pretax income", ("IncomeLossFromContinuingOperationsBeforeIncomeTaxesExtraordinaryItemsNoncontrollingInterest",), False, history["pretax"]),
+            ("Net income", ("ProfitLoss", "NetIncomeLoss"), False, history["pretax"] - v["Income tax expense"]),
+            ("Total assets", ("Assets",), True, sum(v[k] for k in ("Cash and equivalents", "Short-term investments", "Accounts receivable", "Inventory", "Other current assets", "Net property, plant and equipment", "Other noncurrent assets"))),
+        ]
+        for label, tags, instant, modeled in checks:
+            expected, status, source = select_fact(report, tags, start, end, instant)
+            rows.append({"Year": year, "Check": label, "Reported USD": expected,
+                         "Modeled USD": modeled, "Difference USD": modeled - expected,
+                         "Source status": status, "Source": source})
+    return pd.DataFrame(rows)
+
+
+def render_financial_input():
+    """Review boundary: imported data cannot reach any engine until completed and approved."""
+    st.subheader("Financial data source")
+    mode = st.radio("Choose financial data", ["Sample company / manual entry", "Upload EDGAR 10-K files"],
+                    horizontal=True, key="input_mode")
+    config = {year: st.column_config.NumberColumn(year, format="$%.0f", required=True) for year in YEARS}
+    if mode == "Sample company / manual entry":
+        st.caption("Demo defaults only. Full USD; enter reported COGS and reported operating expenses, including their embedded operating D&A. Total operating D&A is added back once for EBITDA.")
+        return st.data_editor(load_baseline_data(), hide_index=True, num_rows="fixed",
+            disabled=["Statement", "Line item"], column_config=config, width="stretch", height=420, key="financial_matrix")
+
+    st.info("REQUIRED FILE TYPE: Original SEC EDGAR 10-K / 10-K/A .htm or .html files containing embedded Inline XBRL tags. "
+            "PDFs, scans, spreadsheets, and a saved EDGAR viewer/search page will not work. Use USD-reporting US-GAAP non-financial companies. "
+            "A valid file enables extraction, but missing/custom tags and D&A/debt classifications can still require manual completion.")
+    with st.expander("Exactly which files to download"):
+        st.markdown("""
+        1. On the company's EDGAR filing details page, find the primary **10-K** document.
+        2. Open the **original HTML document**, outside the Inline XBRL viewer. Use the viewer's
+           **Open as HTML** option if available, or open the underlying `/Archives/edgar/data/...htm` document.
+        3. Save/download the original page as **HTML only** (`.htm` or `.html`). Do not print to PDF or save the viewer shell.
+        4. Upload the latest **two annual 10-K filings** for the same company. If earlier balance-sheet or
+           beginning-cash values are absent, add another older 10-K (up to four files).
+        5. The importer selects three consecutive full fiscal years, prefers newer filings for comparable values,
+           and excludes segment/dimensional facts. Conflicting values remain unresolved.
+
+        Limit: **15 MB per file, 40 MB total**. No filing is fetched from the internet or executed by the app.
+        Uploaded values are processed in this hosted app session; files are not committed to GitHub or saved to an app database.
+        """)
+    uploads = st.file_uploader("Drop original EDGAR Inline XBRL HTML filings here", type=["htm", "html"],
+                              accept_multiple_files=True, key="edgar_uploads")
+    if not uploads:
+        st.caption("Upload filings to populate a blank review matrix. Demo data is never mixed into an import.")
+        st.stop()
+    files = sorted([(upload.name, upload.getvalue()) for upload in uploads], key=lambda item: item[0])
+    if sum(len(data) for _, data in files) > MAX_TOTAL_BYTES:
+        st.error("Combined files exceed 40 MB. Upload fewer/smaller original HTML filings.")
+        st.stop()
+    fingerprint = hashlib.sha256(b"".join(name.encode() + data for name, data in files)).hexdigest()
+    try:
+        if st.session_state.get("_filing_fingerprint") != fingerprint:
+            with st.spinner("Reading consolidated financial tags and fiscal periods…"):
+                report = merge_filings(files)
+            st.session_state["_filing_report"] = report
+            st.session_state["_filing_fingerprint"] = fingerprint
+        report = st.session_state["_filing_report"]
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+    st.success(f"Loaded {report['company']} · CIK {report['entity']} · {len(report['sources'])} filing(s)")
+    periods = pd.DataFrame([{"Model column": year, "Fiscal start": start, "Fiscal end": end}
+                           for year, (start, end) in zip(YEARS, report["periods"])])
+    st.dataframe(periods, hide_index=True, width="stretch")
+    seed = fingerprint[:16]
+    imported, audit = build_import_matrix(report, load_baseline_data())
+    with st.expander("1 · Extracted financial inputs and source evidence", expanded=True):
+        st.caption("Blank cells mean missing or ambiguous—not zero. Fill them from the filing, including verified true zeros. "
+                   "Derived rows are proposals to review. Pay particular attention to short-term borrowings, leases, dividends, other financing flows and cash interest. "
+                   "Historical cash repayments can include refinancing or revolving turnover and may differ from prospective scheduled debt service.")
+        edited = st.data_editor(imported, hide_index=True, num_rows="fixed", width="stretch", height=520,
+            disabled=["Statement", "Line item"], column_config=config, key=f"import_matrix_{seed}")
+        # Rebuild evidence after edits so manual values cannot masquerade as extracted facts.
+        for index, record in audit.iterrows():
+            row = edited.loc[edited["Line item"] == record["Line item"]].iloc[0]
+            reviewed = row[record["Year"]]
+            original = record["Imported value"]
+            changed = pd.notna(reviewed) and (pd.isna(original) or reviewed != original)
+            audit.at[index, "Reviewed value"] = reviewed
+            if changed:
+                audit.at[index, "Status"] = "User supplied / overridden — verify source"
+        st.dataframe(audit, hide_index=True, width="stretch", height=280)
+        st.download_button("Download extraction evidence / reviewed values", audit.to_csv(index=False),
+                           "underwriteiq_import_audit.csv", "text/csv", key=f"audit_{seed}")
+    with st.expander("Find unsupported/custom facts or verify a source number"):
+        query = st.text_input("Search concept or source label", key=f"fact_search_{fingerprint}")
+        browser = fact_browser(report)
+        if query:
+            browser = browser[browser["Concept"].str.contains(query, case=False, regex=False)
+                              | browser["Source label"].str.contains(query, case=False, regex=False)]
+        st.dataframe(browser.head(1000), hide_index=True, width="stretch", height=300)
+        st.caption("Showing up to 1,000 matching facts. Segment facts are excluded from automatic mapping. "
+                   "Custom facts require manual review; source labels may be truncated. All values shown here are full USD.")
+        st.download_button("Download all extracted monetary facts", fact_browser(report).to_csv(index=False),
+                           "underwriteiq_extracted_facts.csv", "text/csv")
+        if report["warnings"]:
+            st.warning(f"{len(report['warnings'])} facts were skipped because of unsupported values or transformations.")
+            st.write(report["warnings"][:30])
+    missing = edited[YEARS].isna()
+    if missing.any().any():
+        st.warning(f"{int(missing.sum().sum())} inputs remain blank. Complete the matrix before analysis can run.")
+        st.stop()
+    try:
+        validated = validate_financial_data(edited)
+    except ValueError as error:
+        st.error(str(error))
+        st.stop()
+    checks = source_reconciliations(report, validated)
+    with st.expander("2 · Reconcile against reported statement totals", expanded=True):
+        st.dataframe(checks, hide_index=True, width="stretch")
+        st.caption("Missing source totals are not verified. Differences may indicate a mapping issue, restricted cash, "
+                   "noncontrolling interests or a broader reported expense scope. Review the filing before proceeding.")
+    tolerance = 1.0
+    gaps = checks[checks["Difference USD"].abs() > tolerance]
+    validated.attrs["source_reconciliation_issues"] = [
+        f"{row['Year']} {row['Check']} differs from the filing by {money(row['Difference USD'])}"
+        for _, row in gaps.iterrows()]
+    validated.attrs["filing_company"] = report["company"]
+    validated.attrs["filing_periods"] = report["periods"]
+    # Content-dependent confirmation expires on every financial edit.
+    approval_key = hashlib.sha256((seed + validated.to_csv(index=False)).encode()).hexdigest()[:16]
+    approved = st.checkbox("I reviewed all three years, corrected missing/custom mappings, verified that operating D&A is added back once and checked all debt repayments, "
+                           "and reviewed the reconciliation differences. Run analysis on these reviewed values.", key=f"approve_import_{approval_key}")
+    if not approved:
+        st.info("Analysis, risk ratings and the credit memo unlock after review confirmation.")
+        st.stop()
+    return validated
 
 
 def validate_facility(facility):
@@ -228,7 +378,8 @@ def evaluate_scenario(frame, facility, haircut=0, compression_bps=0, shock_bps=0
     revenue = values["Revenue"] * (1 - haircut / 100)
     ebitda = revenue * margin
     cogs = values["Cost of goods sold"] * (1 - haircut / 100)
-    pretax = ebitda - values["Depreciation and amortization"] - values["Interest expense"] - first["Interest"] - first["Commitment fee"]
+    pretax = (ebitda - values["Depreciation and amortization"] - values["Interest expense"]
+              - first["Interest"] - first["Commitment fee"] + values["Other non-operating income / (expense)"])
     tax_rate = min(1, max(0, values["Income tax expense"] / history["pretax"])) if history["pretax"] > 0 else 0
     service = history["service"] + first["Debt service"]
     debt = history["debt"] + schedule.iloc[0]["Opening balance"]  # Drawn debt, not undrawn commitment.
@@ -236,7 +387,8 @@ def evaluate_scenario(frame, facility, haircut=0, compression_bps=0, shock_bps=0
     # CFO already includes existing cash interest/tax; deduct only incremental charges.
     residual = (values["Cash from operations (after interest and taxes)"] + ebitda - history["ebitda"]
                 - first["Interest"] - first["Commitment fee"] - values["Capital expenditures"]
-                - values["Existing principal repayments"] - first["Principal"] - values["Dividends"])
+                - values["Existing principal repayments"] - first["Principal"] - values["Dividends"]
+                + min(0, values["Other investing cash flow"]) + min(0, values["Other financing cash flow"]))
     if not all(math.isfinite(v) for v in (ebitda, debt, service, residual, pretax)):
         raise ValueError("Derived totals overflow; reduce the magnitude of financial inputs.")
     return {"facility": stressed_facility, "schedule": schedule, "annual": annual, "ebitda": ebitda,
@@ -244,8 +396,11 @@ def evaluate_scenario(frame, facility, haircut=0, compression_bps=0, shock_bps=0
         "residual_cash": residual, "haircut": haircut,
         "risk": assess_credit_risk(dscr, leverage, ebitda),
         "income": {"Revenue": revenue, "COGS": cogs, "Gross profit": revenue - cogs,
-                   "Operating expenses excluding D&A": revenue - cogs - ebitda, "EBITDA": ebitda,
-                   "D&A": values["Depreciation and amortization"], "Existing book interest": values["Interest expense"],
+                   "Operating expenses (reported)": revenue - cogs - ebitda + values["Depreciation and amortization"],
+                   "Operating income / EBIT": ebitda - values["Depreciation and amortization"],
+                   "D&A add-back (embedded in costs)": values["Depreciation and amortization"], "EBITDA": ebitda,
+                   "D&A deduction from EBITDA": values["Depreciation and amortization"], "Existing book interest": values["Interest expense"],
+                   "Other non-operating income / (expense)": values["Other non-operating income / (expense)"],
                    "New facility interest": first["Interest"], "Commitment fee": first["Commitment fee"],
                    "Pretax income": pretax, "Tax expense": max(0, pretax) * tax_rate,
                    "Net income": pretax - max(0, pretax) * tax_rate}}
@@ -314,10 +469,18 @@ def credit_memo(frame, base, stressed, capacity, haircut, compression, shock):
                 if facility.kind == "Revolver" else
                 f"The facility fully amortizes by maturity; the I/O period is {facility.io_months if facility.kind == FACILITY_TYPES[1] else 0} months.")
     growth = f"Two-year revenue CAGR is {(values['Revenue'] / first_revenue) ** 0.5 - 1:.1%}." if first_revenue > 0 else "Revenue CAGR is undefined."
-    return f"""# CreditScope AI · Credit Memorandum
+    company = frame.attrs.get("filing_company", "Hypothetical manufacturing borrower")
+    # Treat source metadata as literal text rather than user-authored Markdown.
+    company = "".join(ch for ch in str(company) if ch.isalnum() or ch in " .,&()-")
+    source_periods = frame.attrs.get("filing_periods", [])
+    origin = (f"Reviewed EDGAR import: {company}. Fiscal years end " + ", ".join(end for _, end in source_periods) + "."
+              if source_periods else "Sample/manual financial inputs.")
+    return f"""# UnderwriteIQ · Credit Memorandum
+
+{origin}
 
 ## Executive Summary
-The hypothetical manufacturer requests a **{money(facility.amount)} {facility.kind}** facility over
+{company} is evaluated for a proposed **{money(facility.amount)} {facility.kind}** facility over
 **{facility.years} years**, with {facility.payments_per_year} payment periods per year.
 Base nominal rate is {base['facility'].annual_rate:.2f}%; stressed rate is {facility.annual_rate:.2f}%.
 Base DSCR is **{multiple(base['dscr'])}**, stressed DSCR **{multiple(stressed['dscr'])}**,
@@ -336,7 +499,8 @@ and +{shock} bps rate shock. EBITDA becomes {money(stressed['ebitda'])}; annual 
 is {money(stressed['service'])}. **{vulnerability}**
 
 Estimated residual cash after capex, scheduled principal and dividends is **{money(stressed['residual_cash'])}**.
-This cash proxy holds existing taxes and working-capital movements fixed. {maturity}
+This cash proxy holds existing taxes and working-capital movements fixed. Other investing/financing
+outflows reduce available cash; positive non-operating inflows are not assumed to recur. {maturity}
 {stressed['risk']['reason']}
 
 ## Credit Committee Recommendation
@@ -401,7 +565,7 @@ def analyst_answer(challenge, frame, facility, stressed, capacity, compression, 
     return (f"**Principal structure.** {grace}\n\n**Cash sweep.** A separate 50% sweep of positive estimated residual "
             f"cash produces {money(sweep)} of year-end prepayment, leaving {money(first_balance - sweep)} of the "
             "new facility drawn. The proxy starts with historical CFO, adjusts for the EBITDA change, subtracts "
-            "new interest/fees, capex, all scheduled principal and dividends, and holds existing taxes/working "
+            "new interest/fees, capex, all scheduled principal, dividends and other investing/financing outflows, and holds existing taxes/working "
             "capital fixed. No additional borrowings fund the sweep. It does not improve first-year scheduled DSCR; "
             "future revolver redraws could reverse the reduction.\n\n**Controls.** Use reporting and distribution "
             "restrictions, 1.25x coverage and 4.50x leverage tests, verified security and draw controls. "
@@ -432,13 +596,13 @@ def render_risk_matrix():
 
 
 def main():
-    st.set_page_config(page_title="CreditScope AI", page_icon="🏦", layout="wide")
+    st.set_page_config(page_title="UnderwriteIQ", page_icon="🏦", layout="wide")
     st.markdown("""<style>
     .stApp {background-color:#0e1117;color:#e6edf3;}
     [data-testid="stSidebar"] {background-color:#11141a;}
     [data-testid="stMetric"] {border:1px solid #262730;border-radius:6px;padding:12px;}
     </style>""", unsafe_allow_html=True)
-    st.title("CreditScope AI")
+    st.title("UnderwriteIQ")
     st.caption("COMMERCIAL CREDIT INTELLIGENCE | CUSTOM FINANCIAL ENGINE | ZERO API COSTS")
     with st.sidebar:
         st.header("Facility structure")
@@ -464,11 +628,7 @@ def main():
         compression = st.slider("EBITDA margin compression (bps)", 0, 3000, 0, 25, key="compression")
         shock = st.select_slider("Loan rate shock (bps)", options=[0, 100, 200, 300, 400, 500], value=0, key="shock")
         st.caption("100 bps = 1 percentage point. New facility reprices at inception; existing debt stays fixed.")
-    st.subheader("Historical financial matrix")
-    st.caption("Full USD; positive expenses/outflows. CFO is after existing interest and taxes. D&A is entered separately from COGS and operating expenses.")
-    edited = st.data_editor(load_baseline_data(), hide_index=True, num_rows="fixed", disabled=["Statement", "Line item"],
-        column_config={year: st.column_config.NumberColumn(year, format="$%.0f", required=True) for year in YEARS},
-        width="stretch", height=420, key="financial_matrix")
+    edited = render_financial_input()
     try:
         frame = validate_financial_data(edited)
         base = evaluate_scenario(frame, facility)
@@ -547,7 +707,7 @@ def main():
         st.caption("Cash Flow presets reduce EBITDA only; future curves hold existing debt service and Year 3 earnings fixed. I/O step-ups are retained. Revolver maturity takeout is excluded. These are sensitivities, not operating forecasts.")
         render_risk_matrix()
         with st.expander("Stress and cash-flow assumptions"):
-            st.write("Revenue × (1 − haircut); EBITDA = stressed revenue × (historical margin − bps/10,000). COGS scales with revenue and operating expenses are the residual. D&A stays fixed. Taxes use a historical effective rate bounded to 0–100%, with no loss benefit. DSCR includes principal, interest and revolver commitment fees. Residual cash adjusts historical CFO for EBITDA changes and incremental interest/fees, less capex, principal and dividends; existing taxes and working capital stay fixed.")
+            st.write("Revenue × (1 − haircut); EBITDA = stressed revenue × (historical margin − bps/10,000). Reported COGS scales with revenue; reported operating expenses are the residual required by the selected margin. Total operating D&A is added back once for EBITDA and deducted once to calculate EBIT. D&A and other non-operating income stay fixed. Taxes use a historical effective rate bounded to 0–100%, with no loss benefit. DSCR includes principal, interest and revolver commitment fees. Residual cash adjusts historical CFO for EBITDA changes and incremental interest/fees, less capex, principal and dividends; existing taxes and working capital stay fixed.")
     with memo_tab:
         memo = credit_memo(frame, base, stressed, capacity, haircut, compression, shock)
         st.markdown(memo)

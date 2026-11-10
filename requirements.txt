@@ -5,3 +5,5 @@ numpy==2.0.2
 # Included for financial cross-checks and future chart extensions.
 numpy-financial==1.0.0
 plotly==6.3.1
+# Original EDGAR HTML / Inline XBRL parsing; no network calls at runtime.
+lxml==6.0.2
