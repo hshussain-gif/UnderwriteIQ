@@ -21,11 +21,11 @@ ANNUAL_DAYS = (350, 380)
 ALIASES = {
     "Revenue": ("RevenueFromContractWithCustomerExcludingAssessedTax", "Revenues", "SalesRevenueNet"),
     "Cost of goods sold": ("CostOfRevenue", "CostOfGoodsAndServicesSold", "CostOfGoodsSold"),
-    "Depreciation and amortization": ("DepreciationDepletionAndAmortization",),
+    "Depreciation and amortization": ("DepreciationDepletionAndAmortization", "OtherDepreciationAndAmortization"),
     "Interest expense": ("InterestExpenseNonOperating", "InterestAndDebtExpense", "InterestExpense"),
     "Income tax expense": ("IncomeTaxExpenseBenefit",),
     "Cash and equivalents": ("CashAndCashEquivalentsAtCarryingValue",),
-    "Short-term investments": ("ShortTermInvestments", "MarketableSecuritiesCurrent"),
+    "Short-term investments": ("ShortTermInvestments", "MarketableSecuritiesCurrent", "AvailableForSaleSecuritiesDebtSecuritiesCurrent"),
     "Accounts receivable": ("AccountsReceivableNetCurrent", "AccountsNotesAndOtherReceivablesNetCurrent"),
     "Inventory": ("InventoryNet",),
     "Net property, plant and equipment": ("PropertyPlantAndEquipmentNet",),
@@ -62,10 +62,11 @@ class Fact:
     label: str
     filing_end: str
     dimensional: bool
+    source_format: str = "Inline XBRL"
 
     @property
     def standard(self):
-        return "fasb.org/us-gaap/" in self.namespace
+        return "fasb.org/us-gaap/" in self.namespace or self.namespace == "rendered-us-gaap-concept"
 
     @property
     def local(self):
@@ -81,6 +82,164 @@ def child_text(node, name):
         if local_name(child) == name:
             return "".join(child.itertext()).strip()
     return ""
+
+
+def rendered_date(text):
+    """Dates on concept-labelled investor-relations reports, never filename guesses."""
+    text = re.sub(r"\s+", " ", text.replace(".", "")).strip()
+    for pattern in ("%Y-%m-%d", "%b %d, %Y", "%B %d, %Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(text, pattern).date()
+        except ValueError:
+            pass
+    raise ValueError(f"Unrecognized financial column date: {text}")
+
+
+def parse_rendered_filing(filename, root):
+    """Narrow adapter for concept-labelled 'table.report' EDGAR/IR exports.
+
+    These exports lack ix:nonFraction and contextRef. Only the consolidated
+    primary statements with explicit USD units, scales, and annual/date column
+    headers are eligible. Footnote/segment/parenthetical tables are excluded.
+    Provenance explicitly identifies inferred annual starts and rendered sources.
+    """
+    tables = root.xpath('//table[contains(concat(" ", normalize-space(@class), " "), " report ")]')
+    if not tables:
+        raise ValueError("File has neither original Inline XBRL tags nor supported concept-labelled annual financial tables. Download the original SEC HTML rather than a viewer/search page.")
+    metadata = {}
+    def report_rows(table):
+        return table.xpath('./tr|./thead/tr|./tbody/tr|./tfoot/tr')
+    for table in tables:
+        for row in report_rows(table):
+            anchors = row.xpath('./td//a[@onclick]')
+            cells = row.xpath('./td')
+            if not anchors or len(cells) < 2:
+                continue
+            match = re.search(r"['\"]defref_dei_([A-Za-z0-9]+)['\"]", anchors[0].get('onclick', ''))
+            if match and match.group(1) in {'DocumentType', 'DocumentPeriodEndDate', 'EntityRegistrantName', 'EntityCentralIndexKey'}:
+                metadata[match.group(1)] = ' '.join(cells[1].itertext()).strip()
+    if metadata.get('DocumentType', '').upper() not in {'10-K', '10-K/A'}:
+        raise ValueError("Rendered report does not identify itself as a 10-K/10-K/A. Quarterly reports and saved viewer shells are not supported.")
+    try:
+        filing_end = rendered_date(metadata.get('DocumentPeriodEndDate', ''))
+    except ValueError as error:
+        raise ValueError("Rendered report has no readable annual period-end date.") from error
+    entity = metadata.get('EntityCentralIndexKey', '').strip().lstrip('0')
+    if not entity or not entity.isdigit():
+        raise ValueError("Rendered report is missing a usable CIK; cannot identify the reporting company safely.")
+    eligible, annual_ends, warnings = [], set(), []
+    for table_index, table in enumerate(tables):
+        rows = report_rows(table)
+        first = [cell for row in rows for cell in row.xpath('./th')]
+        if not first:
+            continue
+        title = re.sub(r'\s+', ' ', ' '.join(first[0].itertext())).strip()
+        upper = title.upper()
+        balance = upper.startswith('CONSOLIDATED BALANCE SHEET')
+        duration = bool(re.match(r'^CONSOLIDATED STATEMENTS? OF (COMPREHENSIVE INCOME|INCOME|OPERATIONS|CASH FLOWS?)\b', upper))
+        if not (balance or duration) or 'PARENTHETICAL' in upper:
+            continue
+        if not re.search(r'\bUSD\b', title):
+            warnings.append(f'{filename}: skipped non-USD statement {title}')
+            continue
+        scale_match = re.search(r'\$\s+in\s+(Thousands|Millions|Billions)\b', title, re.I)
+        scale = {'thousands': 1000, 'millions': 1000000, 'billions': 1000000000}[scale_match.group(1).lower()] if scale_match else 1
+        if duration and '12 Months Ended' not in ' '.join(' '.join(cell.itertext()) for row in rows[:2] for cell in row.xpath('./th')):
+            warnings.append(f'{filename}: skipped statement without explicit 12-month columns: {title}')
+            continue
+        headers = None
+        for row in rows[:3]:
+            candidates = []
+            for cell in row.xpath('./th'):
+                try:
+                    candidates.append(rendered_date(' '.join(cell.itertext())))
+                except ValueError:
+                    pass
+            if candidates:
+                headers = candidates
+                break
+        if not headers or len(set(headers)) != len(headers) or any(end > filing_end for end in headers):
+            warnings.append(f'{filename}: skipped ambiguous financial date headers: {title}')
+            continue
+        if duration:
+            annual_ends.update(headers)
+        eligible.append((table_index, table, title, balance, headers, scale))
+    facts = []
+    for table_index, table, title, balance, headers, scale in eligible:
+        dimension_scope = ''
+        for row_index, row in enumerate(report_rows(table)):
+            anchors = row.xpath('./td//a[@onclick]')
+            if not anchors:
+                continue
+            onclick = anchors[0].get('onclick', '')
+            # Renderer exports put dimensional sections inside primary statements.
+            # Once a member section begins, conservatively exclude the remaining
+            # section rows from consolidated mapping rather than treating totals
+            # for subscription/services segments as company-wide revenue.
+            if re.search(r'defref_[^\'\"]*Axis=', onclick):
+                dimension_scope = re.sub(r'\s+', ' ', ' '.join(anchors[0].itertext())).strip()
+                continue
+            concept_match = re.search(r"['\"]defref_([A-Za-z0-9-]+)_([A-Za-z0-9]+)['\"]", onclick)
+            if not concept_match:
+                continue
+            prefix, local = concept_match.groups()
+            if (local.endswith(('Abstract', 'Axis', 'Member', 'Domain'))
+                    or re.search(r'PerShare|NumberOf.*Shares|SharesOutstanding|StockShares|Percentage|Percent|Ratio', local)):
+                continue
+            cells = row.xpath('./td|./th')[-len(headers):]
+            if len(cells) != len(headers):
+                continue
+            for column, (cell, end) in enumerate(zip(cells, headers)):
+                if 'num' not in cell.get('class', ''):
+                    continue
+                # Numeric renderer classes plus explicit table units supply value semantics.
+                text = re.sub(r'\s+', '', ''.join(cell.itertext())).replace('$', '').replace(',', '').replace('\u2212', '-')
+                if not text:
+                    continue
+                if text in {'-', '\u2014', '\u2013'}:
+                    value = 0.0
+                else:
+                    negative = text.startswith('(') and text.endswith(')')
+                    try:
+                        value = float(Decimal(text.strip('()')) * scale)
+                    except InvalidOperation:
+                        warnings.append(f'{filename}: skipped unrecognized numeric cell {local} {text[:30]}')
+                        continue
+                    if negative:
+                        value = -abs(value)
+                if not math.isfinite(value):
+                    continue
+                if balance:
+                    start = ''
+                else:
+                    previous = [d for d in annual_ends if 350 <= (end - d).days <= 380]
+                    if previous:
+                        start = (max(previous) + timedelta(days=1)).isoformat()
+                    else:
+                        # Calendar-year anniversary is an explicit approximation only for
+                        # the earliest 12-month column; reviewers see this in provenance.
+                        previous_day = min(end.day, 28) if end.month == 2 else end.day
+                        start = (end.replace(year=end.year - 1, day=previous_day) + timedelta(days=1)).isoformat()
+                context = f'rendered-table-{table_index}-column-{column}'
+                label = re.sub(r'\s+', ' ', ' '.join(anchors[0].itertext())).strip()
+                evidence = f'{label} | {title} | displayed USD x {scale}'
+                if not balance and local.startswith(('Payments', 'Repayments')) and value < 0:
+                    value = abs(value)
+                    evidence += ' | displayed cash outflow normalized to positive payment amount'
+                if dimension_scope:
+                    evidence += f' | segment/member: {dimension_scope}'
+                if not balance:
+                    evidence += ' | 12 months ended; start inferred from prior year-end/calendar anniversary'
+                facts.append(Fact(f'{prefix}:{local}', 'rendered-us-gaap-concept' if prefix == 'us-gaap' else f'rendered-custom:{prefix}',
+                    value, entity, start, end.isoformat(), filename, context, f'table-{table_index}-row-{row_index}-column-{column}',
+                    evidence, filing_end.isoformat(), bool(dimension_scope), 'Rendered concept-labelled financial tables'))
+    if not facts:
+        raise ValueError('No usable consolidated annual USD financial tables were found in the rendered HTML export.')
+    warnings.insert(0, f'{filename}: rendered financial-table export detected, not original Inline XBRL. Primary statements only; annual starts are inferred and footnote facts may require manual review.')
+    return {'facts': facts, 'warnings': warnings, 'entity': entity,
+            'company': metadata.get('EntityRegistrantName', 'Unspecified registrant'),
+            'filing_end': filing_end.isoformat(), 'source': filename,
+            'source_format': 'Rendered concept-labelled financial tables'}
 
 
 def parse_number(node):
@@ -133,13 +292,25 @@ def parse_filing(filename, data):
         raise ValueError("Each filing must be nonempty and no larger than 15 MB.")
     if data.lstrip().startswith(b"%PDF"):
         raise ValueError("A PDF renamed to HTML is not an Inline XBRL filing.")
-    parser = etree.HTMLParser(no_network=True, remove_comments=True, huge_tree=False)
+    # Saved browser pages can be UTF-8 without a charset declaration. lxml's
+    # legacy default would otherwise corrupt em dashes and nonbreaking spaces.
+    declared_encoding = re.search(br'(?:charset\s*=\s*[\"\x27]?|encoding\s*=\s*[\"\x27])([A-Za-z0-9_-]+)', data[:4096], re.I)
+    encoding = None
+    if not declared_encoding:
+        try:
+            data.decode('utf-8')
+            encoding = 'utf-8'
+        except UnicodeDecodeError:
+            encoding = 'windows-1252'
+    parser = etree.HTMLParser(no_network=True, remove_comments=True, huge_tree=False, encoding=encoding)
     try:
         root = etree.fromstring(data, parser)
     except (etree.ParserError, etree.XMLSyntaxError) as error:
         raise ValueError("The uploaded file could not be parsed as HTML.") from error
     if root is None:
         raise ValueError("The uploaded file is empty HTML.")
+    if not any(local_name(node) == 'nonnumeric' for node in root.iter()):
+        return parse_rendered_filing(filename, root)
     namespaces, contexts, units, metadata = {}, {}, {}, {}
     nodes = list(root.iter())
     for node in nodes:
@@ -212,7 +383,7 @@ def parse_filing(filename, data):
         raise ValueError("No consolidated USD US-GAAP monetary facts found. IFRS/non-USD filings are not supported by this importer.")
     return {"facts": facts, "warnings": warnings, "entity": primary_entity,
             "company": metadata.get("EntityRegistrantName", "Unspecified registrant"),
-            "filing_end": filing_end, "source": filename}
+            "filing_end": filing_end, "source": filename, "source_format": "Inline XBRL"}
 
 
 def merge_filings(files):
@@ -244,8 +415,10 @@ def merge_filings(files):
     if any(not 350 <= (date.fromisoformat(b[1]) - date.fromisoformat(a[1])).days <= 380
            for a, b in zip(periods, periods[1:])):
         raise ValueError("The three selected annual periods are not consecutive fiscal years.")
-    return {"facts": facts, "periods": periods, "company": filings[0]["company"],
+    latest_filing = max(filings, key=lambda filing: filing['filing_end'])
+    return {"facts": facts, "periods": periods, "company": latest_filing["company"],
             "entity": filings[0]["entity"], "sources": [f["source"] for f in filings],
+            "source_formats": sorted({f.get('source_format', 'Inline XBRL') for f in filings}),
             "warnings": [warning for filing in filings for warning in filing["warnings"]]}
 
 
@@ -265,17 +438,18 @@ def select_fact(report, concepts, start, end, instant=False):
         scope_note = (" Scope review required: this tag covers long-term debt only; include any short-term/revolver cash flows manually."
                       if fact.local in {"ProceedsFromIssuanceOfLongTermDebt", "RepaymentsOfLongTermDebt"} else "")
         period_label = f"instant {end}" if instant else f"{start} → {end}"
-        return fact.value, "Matched — review scope" if scope_note else "Matched", f"{fact.source} | {fact.concept} | {fact.context} | {fact.fact_id} | {period_label} | USD | {fact.label}{scope_note}"
+        return fact.value, "Matched — review scope" if scope_note else "Matched", f"{fact.source_format} | {fact.source} | {fact.concept} | {fact.context} | {fact.fact_id} | {period_label} | USD | {fact.label}{scope_note}"
     return float("nan"), "Missing", "No supported consolidated USD tag for this field/period. Review the fact browser or source filing; do not assume zero."
 
 
-def build_import_matrix(report, schema):
+def build_import_matrix(report, schema, overrides=None):
     """Start completely blank. Never fill any imported cell from demo defaults.
 
     Reported COGS/operating expenses retain embedded operating D&A.
     Derived residuals preserve total current/noncurrent assets/liabilities and
     other investing/financing/FX cash flows instead of hiding them in a plug.
     """
+    overrides = overrides or {}
     frame = schema.copy()
     years = [c for c in frame.columns if c.startswith("Year ")]
     frame[years] = float("nan")
@@ -286,9 +460,13 @@ def build_import_matrix(report, schema):
         def read(concepts, instant=False, at=None):
             return select_fact(report, concepts, start, at or end, instant)
         def put(item, value, status, source):
-            frame.at[item, year] = value
+            reviewed = overrides.get((item, year), value)
+            frame.at[item, year] = reviewed
+            if (item, year) in overrides:
+                status = "User supplied / overridden — verify source"
             records[item] = {"Year": year, "Period": f"{start} → {end}", "Line item": item,
-                             "Imported value": value, "Status": status, "Source / derivation": source}
+                             "Imported value": value, "Reviewed value": reviewed,
+                             "Status": status, "Source / derivation": source}
         def derive(item, value, components, note):
             if all(math.isfinite(v) for v in components):
                 put(item, value, "Derived — review", note)
@@ -349,5 +527,5 @@ def fact_browser(report):
     return pd.DataFrame([{"Concept": f.concept, "Value (USD)": f.value,
         "Start": f.start, "End": f.end, "Scope": "Segment/dimension — excluded" if f.dimensional else "Consolidated",
         "Tag type": "US-GAAP" if f.standard else "Custom — manual mapping",
-        "File": f.source, "Context": f.context, "Fact ID": f.fact_id, "Source label": f.label}
+        "File": f.source, "Source format": f.source_format, "Context": f.context, "Fact ID": f.fact_id, "Source label": f.label}
         for f in report["facts"]])

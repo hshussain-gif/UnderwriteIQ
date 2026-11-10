@@ -190,8 +190,8 @@ def render_financial_input():
         return st.data_editor(load_baseline_data(), hide_index=True, num_rows="fixed",
             disabled=["Statement", "Line item"], column_config=config, width="stretch", height=420, key="financial_matrix")
 
-    st.info("REQUIRED FILE TYPE: Original SEC EDGAR 10-K / 10-K/A .htm or .html files containing embedded Inline XBRL tags. "
-            "PDFs, scans, spreadsheets, and a saved EDGAR viewer/search page will not work. Use USD-reporting US-GAAP non-financial companies. "
+    st.info("REQUIRED FILE TYPE: 10-K / 10-K/A .htm or .html files: original SEC Inline XBRL, or supported concept-labelled investor-relations financial-table exports (including the Veeva files). "
+            "PDFs, scans, spreadsheets, generic web pages and saved EDGAR viewer/search shells will not work. Use USD-reporting US-GAAP non-financial companies. "
             "A valid file enables extraction, but missing/custom tags and D&A/debt classifications can still require manual completion.")
     with st.expander("Exactly which files to download"):
         st.markdown("""
@@ -199,6 +199,9 @@ def render_financial_input():
         2. Open the **original HTML document**, outside the Inline XBRL viewer. Use the viewer's
            **Open as HTML** option if available, or open the underlying `/Archives/edgar/data/...htm` document.
         3. Save/download the original page as **HTML only** (`.htm` or `.html`). Do not print to PDF or save the viewer shell.
+           **Also supported:** investor-relations HTML exports with concept-labelled consolidated tables, explicit USD scales,
+           annual column dates and cover-page metadata, such as Veeva's HTML download. These contain primary tables only;
+           the app labels them as rendered exports and does not pretend they contain original XBRL contexts or complete footnotes.
         4. Upload the latest **two annual 10-K filings** for the same company. If earlier balance-sheet or
            beginning-cash values are absent, add another older 10-K (up to four files).
         5. The importer selects three consecutive full fiscal years, prefers newer filings for comparable values,
@@ -207,7 +210,7 @@ def render_financial_input():
         Limit: **15 MB per file, 40 MB total**. No filing is fetched from the internet or executed by the app.
         Uploaded values are processed in this hosted app session; files are not committed to GitHub or saved to an app database.
         """)
-    uploads = st.file_uploader("Drop original EDGAR Inline XBRL HTML filings here", type=["htm", "html"],
+    uploads = st.file_uploader("Drop EDGAR / supported investor-relations HTML filings here", type=["htm", "html"],
                               accept_multiple_files=True, key="edgar_uploads")
     if not uploads:
         st.caption("Upload filings to populate a blank review matrix. Demo data is never mixed into an import.")
@@ -216,7 +219,7 @@ def render_financial_input():
     if sum(len(data) for _, data in files) > MAX_TOTAL_BYTES:
         st.error("Combined files exceed 40 MB. Upload fewer/smaller original HTML filings.")
         st.stop()
-    fingerprint = hashlib.sha256(b"".join(name.encode() + data for name, data in files)).hexdigest()
+    fingerprint = hashlib.sha256(b"rendered-import-v2" + b"".join(name.encode() + data for name, data in files)).hexdigest()
     try:
         if st.session_state.get("_filing_fingerprint") != fingerprint:
             with st.spinner("Reading consolidated financial tags and fiscal periods…"):
@@ -228,6 +231,10 @@ def render_financial_input():
         st.error(str(error))
         st.stop()
     st.success(f"Loaded {report['company']} · CIK {report['entity']} · {len(report['sources'])} filing(s)")
+    st.caption("Detected source format: " + "; ".join(report.get("source_formats", ["Inline XBRL"])))
+    if any("Rendered" in kind for kind in report.get("source_formats", [])):
+        st.warning("This is a rendered financial-table export, not original Inline XBRL. Only supported primary consolidated tables are mapped. "
+                   "Annual start dates are inferred from year-end columns; segment rows are excluded. Missing footnote/debt facts still require source review.")
     periods = pd.DataFrame([{"Model column": year, "Fiscal start": start, "Fiscal end": end}
                            for year, (start, end) in zip(YEARS, report["periods"])])
     st.dataframe(periods, hide_index=True, width="stretch")
@@ -239,15 +246,20 @@ def render_financial_input():
                    "Historical cash repayments can include refinancing or revolving turnover and may differ from prospective scheduled debt service.")
         edited = st.data_editor(imported, hide_index=True, num_rows="fixed", width="stretch", height=520,
             disabled=["Statement", "Line item"], column_config=config, key=f"import_matrix_{seed}")
-        # Rebuild evidence after edits so manual values cannot masquerade as extracted facts.
-        for index, record in audit.iterrows():
+        # Propagate explicit corrections into dependent residual/expense rows.
+        # No blanks are treated as zero; changing a derived row remains an override.
+        overrides = {}
+        for _, record in audit.iterrows():
             row = edited.loc[edited["Line item"] == record["Line item"]].iloc[0]
-            reviewed = row[record["Year"]]
-            original = record["Imported value"]
-            changed = pd.notna(reviewed) and (pd.isna(original) or reviewed != original)
-            audit.at[index, "Reviewed value"] = reviewed
-            if changed:
-                audit.at[index, "Status"] = "User supplied / overridden — verify source"
+            reviewed, original = row[record["Year"]], record["Imported value"]
+            if pd.notna(reviewed) and (pd.isna(original) or reviewed != original):
+                overrides[(record["Line item"], record["Year"])] = float(reviewed)
+        if overrides:
+            edited, audit = build_import_matrix(report, load_baseline_data(), overrides)
+            st.write("Final reviewed matrix — dependent rows recalculated from your corrections")
+            st.dataframe(edited, hide_index=True, width="stretch", height=300)
+            st.caption("The final reviewed matrix above feeds analysis. Derived cells may remain blank in the entry editor "
+                       "until their required inputs are supplied; explicit manual overrides always take precedence.")
         st.dataframe(audit, hide_index=True, width="stretch", height=280)
         st.download_button("Download extraction evidence / reviewed values", audit.to_csv(index=False),
                            "underwriteiq_import_audit.csv", "text/csv", key=f"audit_{seed}")
@@ -263,7 +275,7 @@ def render_financial_input():
         st.download_button("Download all extracted monetary facts", fact_browser(report).to_csv(index=False),
                            "underwriteiq_extracted_facts.csv", "text/csv")
         if report["warnings"]:
-            st.warning(f"{len(report['warnings'])} facts were skipped because of unsupported values or transformations.")
+            st.warning(f"{len(report['warnings'])} import notice(s): source-format limitations or skipped unsupported values. Review the details below.")
             st.write(report["warnings"][:30])
     missing = edited[YEARS].isna()
     if missing.any().any():

@@ -91,21 +91,21 @@ UnderwriteIQ/
 
 ## Upload a real company’s 10-K
 
-**Required format: original EDGAR `.htm` or `.html` 10-K / 10-K/A files with embedded Inline XBRL.** PDFs, scans, Excel files, the EDGAR search page, and saved viewer shells are not supported. The current importer targets **USD-reporting US-GAAP non-financial companies**, not IFRS filings, banks or insurers.
+**Required format: `.htm` / `.html` annual filings with original Inline XBRL OR supported concept-labelled investor-relations financial-table exports.** PDFs, scans, Excel files, the EDGAR search page, and saved viewer shells are not supported. Veeva’s investor-relations HTML downloads are supported through a separate rendered-table adapter. Generic HTML/viewer pages are not supported. The current importer targets **USD-reporting US-GAAP non-financial companies**, not IFRS filings, banks or insurers.
 
 1. From the EDGAR filing details page, open the primary 10-K's original HTML document. If needed, use the Inline XBRL viewer's **Open as HTML** option to reach the underlying `/Archives/edgar/data/...htm` document.
 2. Download/save that original document as **HTML only**, preserving its tags. Renaming a PDF to `.html` does not work.
 3. In UnderwriteIQ, select **Upload EDGAR 10-K files**. Start with the latest two annual filings for the same company. Add an older filing if earlier balance-sheet/beginning-cash values are missing. Maximum: four files, 15 MB each, 40 MB combined.
 4. Review the three selected full fiscal-year periods. The importer filters out segment/dimensional facts, applies Inline XBRL scaling/signs, and uses the newest supplied filing's comparable figures. Conflicting duplicates remain ambiguous.
 5. Review the financial matrix and source evidence. Reported operating expenses are taken from a supported tag or derived from revenue minus reported COGS minus operating income. D&A is added back once for EBITDA, with no allocation guessing. Do not use adjusted EBITDA as if it were GAAP operating D&A.
-6. Fill all missing inputs from the source document, including explicitly verified zeros. Custom tags, short-term debt and financing flows need particular care. The fact browser exposes concepts, dates, file names, source labels, context IDs and amounts in full USD.
+6. Fill all missing inputs from the source document, including explicitly verified zeros. Dependent expense/residual rows recalculate from explicit corrections; the final reviewed matrix and audit table show the values used for analysis. Custom tags, short-term debt and financing flows need particular care. The fact browser exposes concepts, dates, file names, source labels, context IDs and amounts in full USD.
 7. Inspect financial-statement and source-total reconciliations. Confirm review to unlock the existing loan engine, stress analysis, credit memo and committee dialogue. Confirmation expires if financial values change.
 
 **Correct file format does not guarantee every metric can be automatically completed.** Missing or unsupported tags remain blank, never zero and never demo values. Unknown debt scope, restricted cash, noncontrolling interests, lease liabilities, restatements and unusual expense classifications may need manual completion. Historical cash repayments can include refinancing or revolving turnover rather than prospective scheduled service. Source/statement differences cause the memo to defer consideration.
 
 The expanded model includes other noncurrent assets, other current liabilities, non-operating income, other investing/financing cash flow and FX cash adjustments. Derived residuals are disclosed, not hidden balancing plugs. Files are processed only in the hosted session; no model, paid API, financial-data fetch or application database is used. Exports include extraction evidence and all extracted monetary facts.
 
-The new importer tests use synthetic Inline XBRL fixtures for scale/sign handling, missing/conflicting facts, annual contexts, entity/currency restrictions, D&A add-back, statement reconciliation and the UI review gate. This is not a claim of universal filing coverage. SEC direct download returned HTTP 403 in this development environment, so a live SEC-file end-to-end run was not completed here. Users download their filings independently; runtime extraction makes no SEC requests.
+The new importer tests use synthetic Inline XBRL and rendered-table fixtures for scale/sign handling, missing/conflicting facts, annual contexts, entity/currency restrictions, D&A add-back, statement reconciliation and the UI review gate. This is not a claim of universal filing coverage. The three user-supplied Veeva 2024, 2025 and 2026 HTML downloads were also tested in the parser and Streamlit review screen. They are rendered financial-table exports, not original Inline XBRL. The adapter requires cover-page metadata, concept-labelled consolidated primary statements, explicit USD scales and annual/date columns. It excludes member/segment sections, EPS/share counts, footnotes and parenthetical tables. Displayed cash-payment outflows are normalized to positive payment inputs, with provenance. Annual starts are inferred from fiscal year-end columns/calendar anniversaries and explicitly flagged. Missing footnote/debt fields remain blank; they are not inferred as zero. Users download filings independently; runtime extraction makes no SEC requests.
 
 [SEC Inline XBRL overview](https://www.sec.gov/data-research/structured-data/inline-xbrl)
 
@@ -143,7 +143,7 @@ python -m pip check
 python -m unittest -v
 ```
 
-The 19 tests cover financial reconciliations, amortization, stress propagation, rating boundaries, debt-capacity constraints, recommendation branches, grace-period burdens, sweep availability and live Streamlit interactions. GitHub Actions is configured to run these checks on Python 3.12/Linux after pushes and pull requests. The configured cloud workflow runs after the repository is uploaded; it is not evidence of a completed cloud deployment.
+The 23 tests cover financial reconciliations, amortization, stress propagation, rating boundaries, debt-capacity constraints, recommendation branches, grace-period burdens, sweep availability and live Streamlit interactions. GitHub Actions is configured to run these checks on Python 3.12/Linux after pushes and pull requests. The configured cloud workflow runs after the repository is uploaded; it is not evidence of a completed cloud deployment.
 
 ## Underwriting assumptions
 

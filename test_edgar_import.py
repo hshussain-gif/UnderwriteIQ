@@ -158,3 +158,62 @@ class EdgarImportTests(unittest.TestCase):
             self.assertEqual(len(app.exception), 0)
             self.assertGreater(len(app.metric), 0)
             self.assertTrue(any('50,000,000' in item.value for item in app.markdown))
+
+
+def rendered_fixture():
+    """Small regression fixture for the table format in the supplied Veeva reports."""
+    def row(concept, label, values, dimension=False):
+        cells = ''.join(f'<td class="nump">{value}</td>' for value in values)
+        return f'''<tr><td><a onclick="Show.showAR(this, 'defref_{concept}', window);">{label}</a></td>{cells}</tr>'''
+    cover = '<table class="report">' + ''.join(row('dei_' + tag, tag, [value]) for tag, value in [
+        ('DocumentType', '10-K'), ('DocumentPeriodEndDate', 'Jan. 31, 2025'),
+        ('EntityRegistrantName', 'Rendered Company'), ('EntityCentralIndexKey', '000123456')]) + '</table>'
+    header = '<tr><th rowspan="2">CONSOLIDATED STATEMENTS OF COMPREHENSIVE INCOME - USD ($) $ in Thousands</th><th colspan="3">12 Months Ended</th></tr><tr><th>Jan. 31, 2025</th><th>Jan. 31, 2024</th><th>Jan. 31, 2023</th></tr>'
+    income = '<table class="report">' + header
+    income += row('us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax', 'Total revenue', ['50,000', '45,000', '40,000'])
+    income += row('us-gaap_EarningsPerShareBasic', 'Basic earnings per share', ['1.23', '1.11', '1.00'])
+    income += row('srt_ProductOrServiceAxis=us-gaap_SubscriptionAndCirculationMember', 'Subscription segment', ['', '', ''])
+    income += row('us-gaap_RevenueFromContractWithCustomerExcludingAssessedTax', 'Segment revenue', ['30,000', '25,000', '20,000'])
+    income += '</table>'
+    cash = '<table class="report">' + header.replace('COMPREHENSIVE INCOME', 'CASH FLOWS')
+    cash += row('us-gaap_PaymentsToAcquirePropertyPlantAndEquipment', 'Capital expenditures', ['(1,234)', '0', '—'])
+    cash += row('us-gaap_NetCashProvidedByUsedInInvestingActivities', 'Net investing flow', ['(1,234)', '(50)', '0'])
+    cash += '</table>'
+    return ('<html><body>' + cover + income + cash + '</body></html>').encode()
+
+
+class RenderedReportTests(unittest.TestCase):
+    def test_annual_currency_scaling_and_segment_exclusion(self):
+        report = merge_filings([('rendered.html', rendered_fixture())])
+        self.assertEqual(report['company'], 'Rendered Company')
+        self.assertEqual(report['periods'][-1], ('2024-02-01', '2025-01-31'))
+        self.assertEqual(select_fact(report, ALIASES['Revenue'], '2024-02-01', '2025-01-31')[0], 50_000_000)
+        self.assertTrue(any(f.dimensional for f in report['facts']))
+        self.assertFalse(any('PerShare' in f.concept for f in report['facts']))
+        self.assertIn('Rendered', report['source_formats'][0])
+        self.assertTrue(any('not original Inline XBRL' in warning for warning in report['warnings']))
+
+    def test_cash_outflows_and_zero_rendering(self):
+        report = merge_filings([('rendered.html', rendered_fixture())])
+        facts = [f for f in report['facts'] if f.local == 'PaymentsToAcquirePropertyPlantAndEquipment']
+        self.assertEqual([f.value for f in facts], [1_234_000, 0, 0])
+        net = [f for f in report['facts'] if f.local == 'NetCashProvidedByUsedInInvestingActivities']
+        self.assertEqual(net[0].value, -1_234_000)
+
+    def test_reject_nonannual_and_missing_metadata(self):
+        for data in (rendered_fixture().replace(b'12 Months Ended', b'3 Months Ended'),
+                     rendered_fixture().replace(b'>10-K<', b'>10-Q<')):
+            with self.assertRaises(ValueError):
+                merge_filings([('bad-rendered.html', data)])
+
+    def test_manual_inputs_recalculate_dependent_rows(self):
+        report = merge_filings([('missing.htm', fixture(omit='InterestExpenseNonOperating'))])
+        schema = load_baseline_data()
+        frame, audit = build_import_matrix(report, schema, {('Interest expense', year): 0 for year in ('Year 1', 'Year 2', 'Year 3')})
+        items = frame.set_index('Line item')
+        self.assertEqual(items.at['Interest expense', 'Year 3'], 0)
+        self.assertEqual(items.at['Other non-operating income / (expense)', 'Year 3'], -900_000)
+        row = audit[(audit['Line item'] == 'Interest expense') & (audit['Year'] == 'Year 3')].iloc[0]
+        self.assertTrue(math.isnan(row['Imported value']))
+        self.assertEqual(row['Reviewed value'], 0)
+        self.assertIn('User supplied', row['Status'])
